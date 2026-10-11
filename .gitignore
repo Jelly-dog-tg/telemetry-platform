@@ -1,0 +1,15 @@
+# CMake build directories
+build/
+build-mingw/
+cmake-build-*/
+
+# Compiled files
+*.o
+*.obj
+*.exe
+*.dll
+*.a
+*.lib
+
+# Generated executable
+telemetry
