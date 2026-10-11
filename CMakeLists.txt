@@ -12,3 +12,22 @@ add_executable(
     CsvStorage.cpp
     DeviceManager.cpp
 )
+
+enable_testing()
+
+add_executable(
+    telemetry_tests
+    tests/DeviceManagerTests.cpp
+    DeviceManager.cpp
+)
+
+target_include_directories(
+    telemetry_tests
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_test(
+    NAME DeviceManagerTests
+    COMMAND telemetry_tests
+)
