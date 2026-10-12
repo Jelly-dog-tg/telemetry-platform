@@ -1,15 +1,13 @@
-# CMake build directories
+# CMake build output
 build/
-build-mingw/
-cmake-build-*/
 
-# Compiled files
-*.o
-*.obj
-*.exe
-*.dll
-*.a
-*.lib
+# Backup files
+*.bak
+*.before_*.bak
 
-# Generated executable
-telemetry
+# Python cache
+__pycache__/
+*.pyc
+
+# Runtime logs
+*.log

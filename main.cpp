@@ -18,6 +18,7 @@ void printDevices(
                   << " | Temperature: "
                   << std::fixed << std::setprecision(1)
                   << device.temperature << " C"
+                  << " | Sequence: " << device.sequence
                   << " | Status: ";
 
         if (device.online) {

@@ -16,3 +16,10 @@ bool addDevice(
     std::vector<Device>& devices,
     const Device& newDevice
 );
+bool updateDeviceTelemetry(
+    std::vector<Device>& devices,
+    int deviceId,
+    double temperature,
+    bool online,
+    int sequence
+);

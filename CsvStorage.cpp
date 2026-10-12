@@ -1,9 +1,11 @@
 #include "CsvStorage.h"
 
+#include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
-#include <iomanip>
+#include <vector>
 
 bool loadDevicesFromCsv(
     const std::string& filename,
@@ -39,6 +41,7 @@ bool loadDevicesFromCsv(
         char comma2 = '\0';
         int onlineValue = -1;
 
+        // Read the original three fields.
         if (!(row >> device.id
                   >> comma1
                   >> device.temperature
@@ -46,19 +49,39 @@ bool loadDevicesFromCsv(
                   >> onlineValue)
             || comma1 != ','
             || comma2 != ','
+            || device.id <= 0
+            || !std::isfinite(device.temperature)
             || (onlineValue != 0 && onlineValue != 1)) {
             std::cerr << "Invalid CSV row: "
                       << line << '\n';
             continue;
         }
 
-        // Reject unexpected extra data.
+        // Old three-column records default to sequence 0.
+        device.sequence = 0;
+
         row >> std::ws;
 
+        // If more data exists, it must be the fourth column.
         if (!row.eof()) {
-            std::cerr << "Extra data in row: "
-                      << line << '\n';
-            continue;
+            char comma3 = '\0';
+
+            if (!(row >> comma3 >> device.sequence)
+                || comma3 != ','
+                || device.sequence < 0) {
+                std::cerr << "Invalid CSV row: "
+                          << line << '\n';
+                continue;
+            }
+
+            // Reject unexpected additional data.
+            row >> std::ws;
+
+            if (!row.eof()) {
+                std::cerr << "Extra data in row: "
+                          << line << '\n';
+                continue;
+            }
         }
 
         device.online = (onlineValue == 1);
@@ -86,14 +109,14 @@ bool saveDevicesToCsv(
         return false;
     }
 
-    file << "id,temperature,online\n";
+    file << "id,temperature,online,sequence\n";
     file << std::fixed << std::setprecision(1);
 
     for (const Device& device : devices) {
         file << device.id << ','
              << device.temperature << ','
-             << (device.online ? 1 : 0)
-             << '\n';
+             << (device.online ? 1 : 0) << ','
+             << device.sequence << '\n';
     }
 
     file.flush();

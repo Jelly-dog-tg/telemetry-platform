@@ -1,5 +1,5 @@
 #include "DeviceManager.h"
-
+#include <cmath>
 #include <iostream>
 
 int countOnlineDevices(
@@ -50,4 +50,39 @@ bool addDevice(
 
     devices.push_back(newDevice);
     return true;
+}
+bool updateDeviceTelemetry(
+    std::vector<Device>& devices,
+    int deviceId,
+    double temperature,
+    bool online,
+    int sequence
+) {
+    // Reject invalid input.
+    if (deviceId <= 0 ||
+        !std::isfinite(temperature) ||
+        sequence <= 0) {
+        return false;
+    }
+
+    // Find the existing device.
+    for (Device& device : devices) {
+        if (device.id == deviceId) {
+
+            // Reject duplicate or stale messages.
+            if (sequence <= device.sequence) {
+                return false;
+            }
+
+            // Update the device state.
+            device.temperature = temperature;
+            device.online = online;
+            device.sequence = sequence;
+
+            return true;
+        }
+    }
+
+    // The device does not exist.
+    return false;
 }
