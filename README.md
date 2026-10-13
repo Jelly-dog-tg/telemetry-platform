@@ -1,136 +1,200 @@
+# Telemetry Platform
 
-# Linux C++ 多设备遥测与故障诊断平台
+## Linux C++ 多设备遥测与故障诊断平台
 
-## 1. 项目简介
+### 1. 项目简介
 
-本项目使用 C++17 和 Linux Socket 实现一个多设备遥测数据接收与故障诊断服务。
+本项目使用 C++17 和 Linux Socket 开发一个多设备遥测管理平台，模拟传感器、机器人及其他智能设备向服务器上传运行状态的场景。
 
-客户端通过 TCP 发送设备编号、温度、在线状态和消息序号。服务器完成消息解析、数据校验、设备状态更新、温度告警及 CSV 持久化。
+服务端负责设备注册、心跳检测、遥测数据接收、异常处理和数据持久化，并支持多个 TCP 客户端同时接入。
 
-项目主要用于实践 Linux C++ 工程开发、网络通信、并发编程和自动化测试。
+项目重点是 Linux C++ 网络编程、协议设计、多线程同步、设备状态管理与软件测试。
 
-## 2. 核心功能
+### 2. 技术栈
 
-- 使用 TCP Socket 接收客户端遥测数据。
-- 采用换行符作为消息结束标志。
-- 校验遥测字段和数值合法性。
-- 根据消息序号拒绝重复或过期的数据。
-- 使用多线程处理不同客户端连接。
-- 使用互斥锁保护共享设备数据和 CSV 更新。
-- 当在线设备温度超过 80℃ 时输出高温告警。
-- 使用 CSV 保存设备状态，并支持旧三列格式的读取。
-- 使用 CMake 构建，使用 CTest 执行自动化测试。
-- 使用 Python 编写 TCP 服务端集成测试，检查并发请求、错误消息和数据持久化。
+- 编程语言：C++17、Python 3
+- 开发环境：Linux / Ubuntu WSL
+- 构建工具：CMake
+- 网络通信：TCP Socket
+- 并发处理：std::thread、std::mutex
+- 运行计数：std::atomic
+- 数据存储：CSV
+- 调试工具：GDB
+- 测试工具：CTest、Python 集成测试
+- 版本管理：Git
 
-## 3. 技术栈
+### 3. 核心功能
 
-- C++17
-- Linux Socket API
-- TCP/IP
-- `std::thread`
-- `std::mutex`、`std::lock_guard`
-- CMake
-- GCC
-- CTest
-- Python 3
-- Git
+**设备管理**
+- 设备注册与重复注册检查
+- 设备在线状态管理
+- 温度数据更新和高温报警
+- 设备状态 CSV 持久化
 
-## 4. 项目结构
+**网络通信**
+- TCP 服务端接入
+- 多客户端并发处理
+- TCP 长连接
+- 半包与粘包处理
+- 消息长度限制
+- 接收超时和异常断连处理
 
-```text
-telemetry-platform/
-├── Device.h
-├── DeviceManager.h
-├── DeviceManager.cpp
-├── CsvStorage.h
-├── CsvStorage.cpp
-├── main.cpp
-├── devices.csv
-├── experiments/
-│   ├── tcp_server.cpp
-│   ├── tcp_client.cpp
-│   └── thread_demo.cpp
-├── tests/
-│   ├── DeviceManagerTests.cpp
-│   ├── TelemetryUpdateTests.cpp
-│   └── TcpServerIntegration.py
-├── CMakeLists.txt
-└── README.md
-```
+**通信协议**
+- REGISTER：设备注册
+- HEARTBEAT：心跳上报
+- TELEMETRY：遥测上报
+- ACK / ERROR：服务器响应
+- 消息序列号校验
+- 非法消息和重复序列号拒绝
 
-## 5. 遥测消息协议
+**故障诊断**
+- 心跳超时自动离线
+- 新心跳恢复在线状态
+- 高温报警
+- 服务器消息与错误统计
 
-消息使用逗号分隔字段，并以换行符结束。
+### 4. 系统架构
 
 ```text
-TELEMETRY,1,36.5,1,1
+Python / C++ Device Clients
+             |
+             | TCP
+             v
+       TCP Server
+             |
+       Client Worker
+             |
+       Message Framing
+             |
+       Protocol Parser
+             |
+       Device Manager
+             |
+       CSV Storage
+
+Background Heartbeat Monitor
+             |
+       Timeout Detection
+             |
+       Device State Update
 ```
 
-字段定义：
+服务端使用一个客户端连接对应一个工作线程的方式处理网络请求，并通过互斥锁保护共享设备数据。
 
-| 字段 | 含义 | 示例 |
-|---|---|---|
-| messageType | 消息类型 | TELEMETRY |
-| deviceId | 设备编号 | 1 |
-| temperature | 温度 | 36.5 |
-| online | 在线状态，1 在线、0 离线 | 1 |
-| sequence | 消息序号 | 1 |
+### 5. 通信协议示例
 
-服务器只接受已登记设备的有效新消息。对于相同设备，消息序号必须大于当前保存的序号。
+设备注册：
 
-## 6. 编译项目
+```text
+REGISTER,100
+```
 
-在 Ubuntu 环境中执行：
+心跳消息：
+
+```text
+HEARTBEAT,100,1
+```
+
+遥测消息：
+
+```text
+TELEMETRY,100,36.5,1,2
+```
+
+遥测字段依次表示：消息类型、设备 ID、温度、在线状态、递增序列号。
+
+每条消息以换行符 `\n` 结束。
+
+### 6. 编译与运行
+
+在项目根目录执行：
 
 ```bash
 cmake -S . -B build
 cmake --build build
 ```
 
-## 7. 运行自动化测试
-
-执行全部测试：
-
-```bash
-ctest --test-dir build --output-on-failure
-```
-
-单独运行设备更新测试：
-
-```bash
-./build/telemetry_update_tests
-```
-
-单独运行 TCP 集成测试：
-
-```bash
-ctest --test-dir build -R TcpServerIntegration -V
-```
-
-## 8. 运行 TCP 服务端和客户端
-
-先启动服务端：
+启动服务端：
 
 ```bash
 ./build/tcp_server
 ```
 
-再打开另一个 Ubuntu 终端，执行：
+启动命令行设备管理程序：
 
 ```bash
-./build/tcp_client
+./build/telemetry
 ```
 
-服务端默认监听 `127.0.0.1:5000`。
+服务端默认监听：
 
-客户端收到有效遥测消息后，服务器会根据设备编号更新状态并保存数据。若设备在线且温度超过 80℃，服务器会输出高温告警。
+```text
+127.0.0.1:5000
+```
 
-## 9. 当前设计限制
+### 7. 自动化测试
 
-- 当前采用一连接一线程模型，尚未使用线程池。
-- 每个连接处理一条以换行符结束的遥测消息。
-- 服务端默认绑定本机回环地址，适用于本机实验。
-- 设备数据使用 CSV 持久化，尚未使用数据库。
-- 当前温度告警使用固定阈值 80℃。
+执行：
 
-这些限制是后续可继续改进的方向。
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+目前包括：
+
+- DeviceManagerTests
+- TelemetryUpdateTests
+- ProtocolMessageTests
+- TcpServerIntegration
+
+另外可运行心跳超时测试：
+
+```bash
+python3 tests/HeartbeatTimeoutIntegration.py ./build/tcp_server
+```
+
+注意：TCP 集成测试会自行启动服务端，运行前应确保 5000 端口未被其他服务端占用。
+
+### 8. 性能测试
+
+性能测试脚本：
+
+```bash
+python3 scripts/stress_test.py \
+    --clients 5 \
+    --duration 10 \
+    --rate 2
+```
+
+正式测试示例：
+
+```bash
+python3 scripts/stress_test.py \
+    --clients 20 \
+    --duration 30 \
+    --rate 5
+```
+
+性能指标包括：
+
+- 成功处理消息数
+- 请求失败数
+- 吞吐量
+- 平均响应延迟
+- P95 响应延迟
+
+具体测试环境和实测结果见：
+
+`docs/performance_test.md`
+
+### 9. 已知限制
+
+- 使用阻塞式 TCP Socket 和每连接一线程的模型，未使用 epoll 或线程池。
+- 当前采用文本行分隔协议，而非二进制协议。
+- 使用 CSV 持久化，未引入数据库。
+- 心跳超时检测以服务端运行期间维护的心跳时间为基础。
+- 未声明经过验证的大规模高并发性能。
+
+### 10. 项目总结
+
+通过本项目，实践了 Linux C++ Socket 编程、C++ 多线程同步、协议解析、设备状态管理、CSV 持久化、自动化测试与基础性能测量，形成了从设备消息上报到状态更新、异常诊断和持久化的完整处理链路。

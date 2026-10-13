@@ -1,0 +1,16 @@
+=== Telemetry Stress Test ===
+Clients: 5
+Duration per client: 10s
+Target rate per client: 2.0 msg/s
+Device 897867 failed: [Errno 111] Connection refused
+Device 897865 failed: [Errno 111] Connection refused
+Device 897864 failed: [Errno 111] Connection refused
+Device 897866 failed: [Errno 111] Connection refused
+Device 897868 failed: [Errno 111] Connection refused
+
+=== Results ===
+Elapsed: 0.01s
+Successful telemetry: 0
+Failed operations: 5
+Successful throughput: 0.00 msg/s
+Observed operation success rate: 0.00%
