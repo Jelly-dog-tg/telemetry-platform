@@ -49,7 +49,7 @@ int main() {
     int deviceId = 1;
     double temperature = 36.5;
     bool online = true;
-    int sequence = 4;
+    int sequence = 5;
 
     // 5. Build the telemetry message.
     std::ostringstream messageStream;

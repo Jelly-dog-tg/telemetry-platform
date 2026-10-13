@@ -49,12 +49,12 @@ add_test(
     NAME TelemetryUpdateTests
     COMMAND telemetry_update_tests
 )
-# TCP client/server experiments
 add_executable(
     tcp_server
     experiments/tcp_server.cpp
     CsvStorage.cpp
     DeviceManager.cpp
+    ProtocolMessage.cpp
 )
 
 target_include_directories(
@@ -62,14 +62,27 @@ target_include_directories(
     PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
 target_link_libraries(
     tcp_server
     PRIVATE
     Threads::Threads
 )
 add_executable(
-    tcp_client
-    experiments/tcp_client.cpp
+    protocol_message_tests
+    tests/ProtocolMessageTests.cpp
+    ProtocolMessage.cpp
+)
+
+target_include_directories(
+    protocol_message_tests
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_test(
+    NAME ProtocolMessageTests
+    COMMAND protocol_message_tests
 )
 add_test(
     NAME TcpServerIntegration
@@ -78,7 +91,6 @@ add_test(
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/TcpServerIntegration.py
         $<TARGET_FILE:tcp_server>
 )
-
 set_tests_properties(
     TcpServerIntegration
     PROPERTIES TIMEOUT 20

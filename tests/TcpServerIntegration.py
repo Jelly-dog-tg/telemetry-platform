@@ -33,6 +33,52 @@ def send_message(message):
         ).strip()
 
 
+def send_fragmented_message(parts):
+    """Send one TCP message in multiple fragments."""
+    with socket.create_connection(
+        (HOST, PORT), timeout=3
+    ) as client:
+        client.settimeout(3)
+
+        for part in parts:
+            client.sendall(part.encode("utf-8"))
+            time.sleep(0.05)
+
+        response = bytearray()
+
+        while b"\n" not in response:
+            chunk = client.recv(1024)
+            if not chunk:
+                break
+            response.extend(chunk)
+
+        return response.decode(
+            "utf-8", errors="replace"
+        ).strip()
+
+
+
+def send_messages_on_one_connection(messages):
+    """Send multiple messages in one TCP connection."""
+    with socket.create_connection((HOST, PORT), timeout=3) as client:
+        client.settimeout(3)
+
+        # One sendall simulates coalesced TCP messages.
+        client.sendall("".join(messages).encode("utf-8"))
+
+        responses = []
+        with client.makefile("rb") as reader:
+            for _ in messages:
+                response = reader.readline()
+                if not response:
+                    break
+                responses.append(
+                    response.decode("utf-8", errors="replace").strip()
+                )
+
+        return responses
+
+
 def main():
     if len(sys.argv) != 2:
         print("Usage: TcpServerIntegration.py SERVER_PATH")
@@ -155,6 +201,102 @@ def main():
 
                 print("[PASS] Invalid protocol message was rejected")
 
+                                # Test device registration.
+                register_response = send_message(
+                    "REGISTER,100\n"
+                )
+
+                if register_response != "ACK: registered":
+                    print("FAIL: Device registration failed.")
+                    print(register_response)
+                    return 1
+
+                print("[PASS] Device registration succeeded")
+
+                # Registration of the same device is idempotent.
+                duplicate_register_response = send_message(
+                    "REGISTER,100\n"
+                )
+
+                if duplicate_register_response != "ACK: already registered":
+                    print("FAIL: Duplicate registration was not handled.")
+                    print(duplicate_register_response)
+                    return 1
+
+                print("[PASS] Duplicate registration is handled")
+
+                # A registered device can send a heartbeat.
+                heartbeat_response = send_message(
+                    "HEARTBEAT,100,1\n"
+                )
+
+                if heartbeat_response != "ACK: heartbeat":
+                    print("FAIL: Heartbeat failed.")
+                    print(heartbeat_response)
+                    return 1
+
+                print("[PASS] Heartbeat updated device state")
+
+                # A stale heartbeat must be rejected.
+                stale_heartbeat_response = send_message(
+                    "HEARTBEAT,100,1\n"
+                )
+
+                if not stale_heartbeat_response.startswith("ERROR:"):
+                    print("FAIL: Stale heartbeat was accepted.")
+                    print(stale_heartbeat_response)
+                    return 1
+
+                print("[PASS] Stale heartbeat was rejected")
+
+                # Test multiple messages on the same TCP connection.
+                batch_responses = send_messages_on_one_connection([
+                    "REGISTER,102\n",
+                    "HEARTBEAT,102,1\n",
+                    "TELEMETRY,102,45.0,1,2\n",
+                ])
+
+                expected_responses = [
+                    "ACK: registered",
+                    "ACK: heartbeat",
+                    "ACK from telemetry server",
+                ]
+
+                if batch_responses != expected_responses:
+                    print("FAIL: TCP long connection or coalescing.")
+                    print("Expected:", expected_responses)
+                    print("Actual:", batch_responses)
+                    return 1
+
+                print("[PASS] Long connection and TCP coalescing")
+                
+                
+                # Test a message split across multiple TCP sends.
+                fragmented_response = send_fragmented_message([
+                    "REG",
+                    "ISTER,101",
+                    "\n",
+                ])
+
+                if fragmented_response != "ACK: registered":
+                    print("FAIL: Fragmented TCP message failed.")
+                    print(fragmented_response)
+                    return 1
+
+                print("[PASS] Fragmented TCP message was handled")
+
+                # Test an oversized message.
+                oversized_response = send_message(
+                    "X" * 1100 + "\n"
+                )
+
+                if not oversized_response.startswith("ERROR:"):
+                    print("FAIL: Oversized message was not rejected.")
+                    print(oversized_response)
+                    return 1
+
+                print("[PASS] Oversized TCP message was rejected")
+
                 # Verify data persisted and CSV was upgraded.
                 with csv_path.open(
                     newline="", encoding="utf-8"
@@ -191,6 +333,25 @@ def main():
                 print("[PASS] Old CSV loaded and upgraded to four columns")
                 print("[PASS] Concurrent device updates were saved")
                 print("[PASS] Rejected messages did not corrupt device data")
+                                # Verify registration and heartbeat were persisted.
+                registered = rows.get(100)
+
+                if registered is None:
+                    print("FAIL: Registered device was not saved.")
+                    return 1
+
+                if (
+                    abs(float(registered["temperature"]) - 0.0) > 1e-9
+                    or int(registered["online"]) != 1
+                    or int(registered["sequence"]) != 1
+                ):
+                    print(
+                        "FAIL: Registered device has incorrect state:",
+                        registered,
+                    )
+                    return 1
+
+                print("[PASS] Registration and heartbeat were persisted")                
                 print("\nAll TCP integration tests passed.")
                 return 0
 

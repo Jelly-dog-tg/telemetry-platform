@@ -1,25 +1,36 @@
-#include <arpa/inet.h>
-#include <cmath>
-#include <cstdio>
-#include <iostream>
-#include <netinet/in.h>
-#include <sstream>
-#include <stdexcept>
-#include <string>
-#include <sys/socket.h>
-#include <unistd.h>
 #include "CsvStorage.h"
 #include "Device.h"
 #include "DeviceManager.h"
-#include <vector>
+#include "ProtocolMessage.h"
+
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cstdio>
 #include <exception>
 #include <functional>
+#include <iostream>
 #include <mutex>
-#include <thread>
-#include <cerrno>
+#include <netinet/in.h>
+#include <string>
+#include <sys/socket.h>
 #include <sys/time.h>
+#include <thread>
+#include <chrono>
+#include <unistd.h>
+#include <vector>
+#include <atomic>
 
-// Send the complete response, including handling partial sends.
+struct ServerStatistics {
+
+    std::atomic<int> connections{0};
+
+    std::atomic<int> messagesReceived{0};
+
+    std::atomic<int> successfulMessages{0};
+
+    std::atomic<int> failedMessages{0};
+};
+// Send the entire response, handling partial sends.
 bool sendAll(int socketFd, const std::string& data) {
     std::size_t totalSent = 0;
 
@@ -31,8 +42,17 @@ bool sendAll(int socketFd, const std::string& data) {
             MSG_NOSIGNAL
         );
 
-        if (sent <= 0) {
+        if (sent == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
             std::perror("send");
+            return false;
+        }
+
+        if (sent == 0) {
+            std::cerr << "Connection closed during send\n";
             return false;
         }
 
@@ -42,279 +62,450 @@ bool sendAll(int socketFd, const std::string& data) {
     return true;
 }
 
-// Receive one complete newline-terminated message.
-bool receiveLine(int clientFd, std::string& buffer) {
+// Receive one newline-terminated message.
+// Keep unprocessed bytes for the next message.
+enum class ReceiveResult {
+    Message,
+    Closed,
+    Error
+};
+
+ReceiveResult receiveLine(
+    int clientFd,
+    std::string& pending,
+    std::string& line
+) {
     constexpr std::size_t maxMessageSize = 1024;
     char chunk[256];
 
-    while (buffer.size() < maxMessageSize) {
-        ssize_t received = recv(
-            clientFd,
-            chunk,
-            sizeof(chunk),
-            0
-        );
+    line.clear();
 
-if (received == -1) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        std::cerr << "Client receive timed out\n";
-    } else {
-        std::perror("recv");
-    }
+    while (true) {
+        const std::size_t pos = pending.find('\n');
 
-    return false;
-}
-        if (received == 0) {
-            std::cerr
-                << "Client disconnected before completing the message\n";
-            return false;
-        }
-
-        buffer.append(
-            chunk,
-            static_cast<std::size_t>(received)
-        );
-
-        std::size_t newlinePos = buffer.find('\n');
-
-        if (newlinePos != std::string::npos) {
-            if (newlinePos + 1 > maxMessageSize) {
-                std::cerr << "Telemetry message is too large\n";
-                return false;
+        if (pos != std::string::npos) {
+            if (pos + 1 > maxMessageSize) {
+                std::cerr << "Message is too large\n";
+                return ReceiveResult::Error;
             }
 
-            buffer.resize(newlinePos + 1);
-            return true;
+            line = pending.substr(0, pos + 1);
+            pending.erase(0, pos + 1);
+            return ReceiveResult::Message;
         }
 
-        if (buffer.size() >= maxMessageSize) {
-            std::cerr
-                << "Telemetry message is too large or incomplete\n";
-            return false;
+        if (pending.size() >= maxMessageSize) {
+            std::cerr << "Message exceeds size limit\n";
+            return ReceiveResult::Error;
         }
+
+        const ssize_t received = recv(
+            clientFd, chunk, sizeof(chunk), 0
+        );
+
+        if (received > 0) {
+            pending.append(
+                chunk,
+                static_cast<std::size_t>(received)
+            );
+            continue;
+        }
+
+        if (received == 0) {
+            if (!pending.empty()) {
+                std::cerr << "Incomplete message on disconnect\n";
+                return ReceiveResult::Error;
+            }
+
+            return ReceiveResult::Closed;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            std::cerr << "Client receive timed out\n";
+        } else {
+            std::perror("recv");
+        }
+
+        return ReceiveResult::Error;
     }
-
-    return false;
 }
 
-// Process one client connection.
-void handleClient(
+// Process one registered-device operation or telemetry message.
+bool handleClient(
     int clientFd,
     std::vector<Device>& devices,
-    std::mutex& devicesMutex
-) {    std::string buffer;
+    std::mutex& devicesMutex,
+    const std::string& buffer
+) {
+    ProtocolMessage message;
+    std::string parseError;
 
-    if (!receiveLine(clientFd, buffer)) {
-        sendAll(
-            clientFd,
-            "ERROR: incomplete or oversized message\n"
-        );
-        return;
+    if (!parseProtocolMessage(
+            buffer,
+            message,
+            parseError
+        )) {
+        std::cerr << "Invalid protocol message: "
+                  << parseError << '\n';
+
+        sendAll(clientFd, "ERROR: " + parseError + "\n");
+        return false;
     }
 
-    // Remove the line ending.
-    if (!buffer.empty() && buffer.back() == '\n') {
-        buffer.pop_back();
-    }
+    // --------------------------------------------------------
+    // 1. REGISTER: register a new device.
+    // --------------------------------------------------------
+    if (message.type == MessageType::Register) {
+        bool alreadyRegistered = false;
+        bool added = false;
+        bool saved = false;
 
-    if (!buffer.empty() && buffer.back() == '\r') {
-        buffer.pop_back();
-    }
+        {
+            std::lock_guard<std::mutex> lock(devicesMutex);
 
-    // Split the message into five fields.
-    std::istringstream messageStream(buffer);
-
-    std::string messageType;
-    std::string deviceIdText;
-    std::string temperatureText;
-    std::string onlineText;
-    std::string sequenceText;
-
-    bool formatOk =
-        static_cast<bool>(
-            std::getline(messageStream, messageType, ',')
-        ) &&
-        static_cast<bool>(
-            std::getline(messageStream, deviceIdText, ',')
-        ) &&
-        static_cast<bool>(
-            std::getline(messageStream, temperatureText, ',')
-        ) &&
-        static_cast<bool>(
-            std::getline(messageStream, onlineText, ',')
-        ) &&
-        static_cast<bool>(
-            std::getline(messageStream, sequenceText)
-        );
-
-    if (!formatOk || messageType != "TELEMETRY") {
-        std::cerr << "Invalid telemetry message format\n";
-        sendAll(clientFd, "ERROR: invalid message format\n");
-        return;
-    }
-
-    try {
-        // Convert strings into numeric values.
-        std::size_t pos = 0;
-
-        int deviceId = std::stoi(deviceIdText, &pos);
-        if (pos != deviceIdText.size()) {
-            throw std::invalid_argument("invalid device ID");
-        }
-
-        pos = 0;
-        double temperature = std::stod(temperatureText, &pos);
-        if (pos != temperatureText.size()) {
-            throw std::invalid_argument("invalid temperature");
-        }
-
-        pos = 0;
-        int onlineValue = std::stoi(onlineText, &pos);
-        if (pos != onlineText.size()) {
-            throw std::invalid_argument("invalid online status");
-        }
-
-        pos = 0;
-        int sequence = std::stoi(sequenceText, &pos);
-        if (pos != sequenceText.size()) {
-            throw std::invalid_argument("invalid sequence");
-        }
-
-        // Validate the fields.
-        if (deviceId <= 0) {
-            throw std::invalid_argument(
-                "device ID must be positive"
+            alreadyRegistered = deviceExists(
+                devices,
+                message.deviceId
             );
+
+            if (!alreadyRegistered) {
+                const std::vector<Device> previousDevices = devices;
+
+                added = addDevice(
+                    devices,
+                    Device{
+                        message.deviceId,
+                        0.0,
+                        true,
+                        0
+                    }
+                );
+
+                if (added) {
+                    saved = saveDevicesToCsv(
+                        devices,
+                        "devices.csv"
+                    );
+
+                    if (!saved) {
+                        devices = previousDevices;
+                    }
+                }
+            }
         }
 
-        if (!std::isfinite(temperature)) {
-            throw std::invalid_argument(
-                "temperature must be finite"
-            );
+        if (alreadyRegistered) {
+            return sendAll(clientFd, "ACK: already registered\n");
         }
 
-        if (onlineValue != 0 && onlineValue != 1) {
-            throw std::invalid_argument(
-                "online status must be 0 or 1"
-            );
+        if (!added) {
+            sendAll(clientFd, "ERROR: registration failed\n");
+        return false;
         }
 
-        if (sequence <= 0) {
-            throw std::invalid_argument(
-                "sequence must be positive"
-            );
-        }
-// Update the existing device and save it safely.
-bool updated = false;
-bool saved = false;
-
-{
-    std::lock_guard<std::mutex> lock(devicesMutex);
-
-    // Keep a copy in case saving fails.
-    std::vector<Device> previousDevices = devices;
-
-    updated = updateDeviceTelemetry(
-        devices,
-        deviceId,
-        temperature,
-        onlineValue == 1,
-        sequence
-    );
-
-    if (updated) {
-        saved = saveDevicesToCsv(
-            devices,
-            "devices.csv"
-        );
-
-        // Roll back the in-memory state if saving fails.
         if (!saved) {
-            devices = previousDevices;
+            sendAll(clientFd, "ERROR: failed to save device\n");
+        return false;
+        }
+
+        std::cout << "[INFO] Device registered: "
+                  << message.deviceId << '\n';
+
+        return sendAll(clientFd, "ACK: registered\n");
+    }
+
+    // --------------------------------------------------------
+    // 2. HEARTBEAT: update device online state and sequence.
+    // --------------------------------------------------------
+    if (message.type == MessageType::Heartbeat) {
+        bool updated = false;
+        bool saved = false;
+
+        {
+            std::lock_guard<std::mutex> lock(devicesMutex);
+
+            const std::vector<Device> previousDevices = devices;
+
+            updated = updateDeviceHeartbeat(
+                devices,
+                message.deviceId,
+                message.sequence
+            );
+
+            if (updated) {
+                saved = saveDevicesToCsv(
+                    devices,
+                    "devices.csv"
+                );
+
+                if (!saved) {
+                    devices = previousDevices;
+                }
+            }
+        }
+
+        if (!updated) {
+            sendAll(clientFd, "ERROR: unknown device or stale sequence\n");
+        return false;
+        }
+
+        if (!saved) {
+            sendAll(clientFd, "ERROR: failed to save device\n");
+        return false;
+        }
+
+        std::cout << "[INFO] Heartbeat received from device "
+                  << message.deviceId << '\n';
+
+        return sendAll(clientFd, "ACK: heartbeat\n");
+    }
+
+    // --------------------------------------------------------
+    // 3. TELEMETRY: update an existing device's telemetry.
+    // --------------------------------------------------------
+    const int deviceId = message.deviceId;
+    const double temperature = message.temperature;
+    const bool online = message.online;
+    const int sequence = message.sequence;
+
+    bool updated = false;
+    bool saved = false;
+
+    {
+        std::lock_guard<std::mutex> lock(devicesMutex);
+
+        const std::vector<Device> previousDevices = devices;
+
+        updated = updateDeviceTelemetry(
+            devices,
+            deviceId,
+            temperature,
+            online,
+            sequence
+        );
+
+        if (updated) {
+            saved = saveDevicesToCsv(
+                devices,
+                "devices.csv"
+            );
+
+            if (!saved) {
+                devices = previousDevices;
+            }
         }
     }
-}
 
-if (!updated) {
-    std::cerr
-        << "Device not found or stale sequence for device: "
-        << deviceId << '\n';
+    if (!updated) {
+        std::cerr
+            << "Device not found or stale sequence for device: "
+            << deviceId << '\n';
 
-    sendAll(
+        sendAll(clientFd, "ERROR: device not found or stale sequence\n");
+        return false;
+    }
+
+    if (!saved) {
+        std::cerr << "Failed to save device data\n";
+
+        sendAll(clientFd, "ERROR: failed to save device data\n");
+        return false;
+    }
+
+    std::cout << "\nTelemetry data validated successfully\n";
+    std::cout << "Device ID: " << deviceId << '\n';
+    std::cout << "Temperature: " << temperature << " C\n";
+    std::cout << "Online: "
+              << (online ? "Yes" : "No") << '\n';
+    std::cout << "Sequence: " << sequence << '\n';
+    std::cout << "[INFO] Device state updated and saved.\n";
+
+    if (online && temperature > 80.0) {
+        std::cerr << "[ALARM] High temperature detected!\n";
+        std::cerr << "Device ID: " << deviceId << '\n';
+        std::cerr << "Temperature: " << temperature << " C\n";
+    } else if (temperature > 80.0) {
+        std::cout
+            << "[INFO] Device is offline; no active alarm.\n";
+    } else {
+        std::cout << "[INFO] Temperature is normal.\n";
+    }
+
+    return sendAll(
         clientFd,
-        "ERROR: device not found or stale sequence\n"
+        "ACK from telemetry server\n"
     );
-    return;
 }
+// Periodically check heartbeat timeout.
+void heartbeatMonitor(
+    std::vector<Device>& devices,
+    std::mutex& devicesMutex,
+    ServerStatistics& statistics
+) {
+    constexpr int timeoutSeconds = 30;
 
-if (!saved) {
-    std::cerr << "Failed to save device data\n";
+    while (true) {
 
-    sendAll(
-        clientFd,
-        "ERROR: failed to save device data\n"
-    );
-    return;
-}
+        std::this_thread::sleep_for(
+            std::chrono::seconds(5)
+        );
 
-std::cout << "[INFO] Device state updated and saved.\n";
-        std::cout << "\nTelemetry data validated successfully\n";
-        std::cout << "Device ID: " << deviceId << '\n';
-        std::cout << "Temperature: " << temperature << " C\n";
-        std::cout << "Online: "
-                  << (onlineValue == 1 ? "Yes" : "No") << '\n';
-        std::cout << "Sequence: " << sequence << '\n';
+        bool changed = false;
 
-        // Apply the temperature alarm rule.
-if (onlineValue == 1 && temperature > 80.0) {
-    std::cerr << "[ALARM] High temperature detected!\n";
-    std::cerr << "Device ID: " << deviceId << '\n';
-    std::cerr << "Temperature: " << temperature << " C\n";
-} else if (temperature > 80.0) {
-    std::cout << "[INFO] Device is offline; "
-                 "no active alarm.\n";
-} else {
-    std::cout << "[INFO] Temperature is normal.\n";
-}
-        // Send an acknowledgement to the client.
-        sendAll(clientFd, "ACK from telemetry server\n");
+        {
+            std::lock_guard<std::mutex> lock(
+                devicesMutex
+            );
 
-    } catch (const std::exception& e) {
-        std::cerr << "Invalid telemetry data: "
-                  << e.what() << '\n';
+            const std::vector<Device> previousDevices =
+                devices;
 
-        sendAll(clientFd, "ERROR: invalid telemetry data\n");
+
+            checkHeartbeatTimeout(
+                devices,
+                timeoutSeconds
+            );
+
+
+            for (std::size_t i = 0;
+                 i < devices.size();
+                 ++i) {
+
+                if (devices[i].online !=
+                    previousDevices[i].online) {
+
+                    changed = true;
+                    break;
+                }
+            }
+
+
+            if (changed) {
+
+                if (!saveDevicesToCsv(
+                        devices,
+                        "devices.csv")) {
+
+                    std::cerr
+                        << "[ERROR] Failed to save "
+                        << "heartbeat timeout state\n";
+
+                    devices = previousDevices;
+                }
+            }
+        }
+
+        int onlineCount = 0;
+
+        {
+            std::lock_guard<std::mutex> lock(devicesMutex);
+            onlineCount = countOnlineDevices(devices);
+        }
+
+        std::cout
+            << "\n========== Server Statistics ==========\n"
+            << "Total connections: "
+            << statistics.connections.load()
+            << "\nMessages received: "
+            << statistics.messagesReceived.load()
+            << "\nSuccessful messages: "
+            << statistics.successfulMessages.load()
+            << "\nFailed messages: "
+            << statistics.failedMessages.load()
+            << "\nOnline devices: "
+            << onlineCount
+            << "\n=======================================\n";
     }
 }
 
+// Handle the lifetime of one client connection.
 void clientWorker(
     int clientFd,
     std::vector<Device>& devices,
-    std::mutex& devicesMutex
+    std::mutex& devicesMutex,
+    ServerStatistics& statistics
 ) {
-    // Set a receive timeout for this client.
-timeval timeout{};
-timeout.tv_sec = 5;
-timeout.tv_usec = 0;
+    timeval timeout{};
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
 
-if (setsockopt(
-        clientFd,
-        SOL_SOCKET,
-        SO_RCVTIMEO,
-        &timeout,
-        sizeof(timeout)
-    ) == -1) {
-    std::perror("setsockopt SO_RCVTIMEO");
-    close(clientFd);
-    return;
-}
+    if (setsockopt(
+            clientFd,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &timeout,
+            sizeof(timeout)
+        ) == -1) {
+        std::perror("setsockopt SO_RCVTIMEO");
+        close(clientFd);
+        return;
+    }
+
     std::cout << "\nClient connected\n";
+    statistics.connections++;
+    try {
+        std::string pending;
 
-    handleClient(
-        clientFd,
-        devices,
-        devicesMutex
-    );
+        while (true) {
+            std::string line;
+
+            const ReceiveResult result = receiveLine(
+                clientFd, pending, line
+            );
+
+            if (result == ReceiveResult::Closed) {
+                break;
+            }
+
+            if (result == ReceiveResult::Error) {
+                sendAll(
+                    clientFd,
+                    "ERROR: incomplete, oversized or timed-out message\n"
+                );
+                break;
+            }
+
+statistics.messagesReceived++;
+
+            try {
+                const bool success = handleClient(
+                    clientFd,
+                    devices,
+                    devicesMutex,
+                    line
+                );
+
+                if (success) {
+                    statistics.successfulMessages++;
+                } else {
+                    statistics.failedMessages++;
+                }
+
+            } catch (...) {
+                statistics.failedMessages++;
+                throw;
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Client processing exception: "
+                  << e.what() << '\n';
+
+        sendAll(
+            clientFd,
+            "ERROR: internal server error\n"
+        );
+    } catch (...) {
+        std::cerr << "Unknown client processing exception\n";
+
+        sendAll(
+            clientFd,
+            "ERROR: internal server error\n"
+        );
+    }
 
     close(clientFd);
 
@@ -322,17 +513,29 @@ if (setsockopt(
 }
 
 int main() {
+    // Load device state before accepting connections.
     std::vector<Device> devices;
 
-if (!loadDevicesFromCsv("devices.csv", devices)) {
-    std::cerr << "Server could not load devices.csv\n";
-    return 1;
-}
-std::mutex devicesMutex;
-std::cout << "Loaded " << devices.size()
-          << " device(s) from devices.csv\n";
+    if (!loadDevicesFromCsv("devices.csv", devices)) {
+        std::cerr << "Server could not load devices.csv\n";
+        return 1;
+    }
 
-    // 1. Create the listening socket.
+    std::mutex devicesMutex;
+ServerStatistics statistics;    
+std::thread monitorThread(
+    heartbeatMonitor,
+    std::ref(devices),
+    std::ref(devicesMutex),
+    std::ref(statistics)
+);
+
+monitorThread.detach();
+    std::cout << "Loaded "
+              << devices.size()
+              << " device(s) from devices.csv\n";
+
+    // Create the listening socket.
     int serverFd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (serverFd == -1) {
@@ -340,7 +543,7 @@ std::cout << "Loaded " << devices.size()
         return 1;
     }
 
-    // 2. Allow the port to be reused after restarting the server.
+    // Allow reuse of the local port after restarting.
     int opt = 1;
 
     if (setsockopt(
@@ -350,12 +553,12 @@ std::cout << "Loaded " << devices.size()
             &opt,
             sizeof(opt)
         ) == -1) {
-        std::perror("setsockopt");
+        std::perror("setsockopt SO_REUSEADDR");
         close(serverFd);
         return 1;
     }
 
-    // 3. Configure the local server address.
+    // Configure the server address.
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port = htons(5000);
@@ -370,7 +573,6 @@ std::cout << "Loaded " << devices.size()
         return 1;
     }
 
-    // 4. Bind the socket to the address and port.
     if (bind(
             serverFd,
             reinterpret_cast<sockaddr*>(&serverAddr),
@@ -381,7 +583,6 @@ std::cout << "Loaded " << devices.size()
         return 1;
     }
 
-    // 5. Start listening for incoming connections.
     if (listen(serverFd, 10) == -1) {
         std::perror("listen");
         close(serverFd);
@@ -391,7 +592,7 @@ std::cout << "Loaded " << devices.size()
     std::cout
         << "Telemetry server listening on 127.0.0.1:5000\n";
 
-    // 6. Keep accepting clients until the server is stopped.
+    // Accept clients continuously. Each client gets its own thread.
     while (true) {
         sockaddr_in clientAddr{};
         socklen_t clientLen = sizeof(clientAddr);
@@ -403,28 +604,33 @@ std::cout << "Loaded " << devices.size()
         );
 
         if (clientFd == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
             std::perror("accept");
             continue;
         }
-try {
-    std::thread worker(
-        clientWorker,
-        clientFd,
-        std::ref(devices),
-        std::ref(devicesMutex)
-    );
 
-    worker.detach();
+        try {
+            std::thread worker(
+                clientWorker,
+                clientFd,
+                std::ref(devices),
+                std::ref(devicesMutex),
+                std::ref(statistics)
+            );
 
-} catch (const std::exception& e) {
-    std::cerr << "Failed to start client thread: "
-              << e.what() << '\n';
+            worker.detach();
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to start client thread: "
+                      << e.what() << '\n';
 
-    close(clientFd);
-}
-
+            close(clientFd);
+        }
     }
 
+    // The current server runs until externally terminated.
     close(serverFd);
     return 0;
 }
